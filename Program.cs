@@ -92,7 +92,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V90_INSTANCIAS_SEPARADAS",
+            version = "V91_INSTANCIA_FIJA",
             instanceCode = GetInstanceCode(),
             instanceSucursalId = GetInstanceSucursalId(),
             instanceSector = GetInstanceSector(),
@@ -113,7 +113,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V90_INSTANCIAS_SEPARADAS",
+    apiVersion = "V91_INSTANCIA_FIJA",
     instanceCode = GetInstanceCode(),
     instanceSucursalId = GetInstanceSucursalId(),
     instanceSector = GetInstanceSector(),
@@ -5864,13 +5864,27 @@ static string GetInstanceCode()
 static int GetInstanceSucursalId()
 {
     string raw = (Environment.GetEnvironmentVariable("INSTANCE_SUCURSAL_ID") ?? "").Trim();
-    return int.TryParse(raw, out int sid) && (sid == 1 || sid == 2) ? sid : 0;
+    if (int.TryParse(raw, out int sid) && (sid == 1 || sid == 2)) return sid;
+
+    // V91: respaldo seguro según INSTANCE_CODE. Evita que una instancia dedicada
+    // quede en modo compartido si Railway no aplica una variable individual.
+    string code = GetInstanceCode();
+    if (code.Contains("PREMIUM")) return 2;
+    if (code.Contains("EL_BRUJO") || code.Contains("CLUB") || code == "BRUJO") return 1;
+    return 0;
 }
 
 static string GetInstanceSector()
 {
     string raw = (Environment.GetEnvironmentVariable("INSTANCE_SECTOR") ?? "").Trim().ToUpperInvariant();
     if (raw == "ARRIBA" || raw == "ABAJO" || raw == "GENERAL") return raw;
+
+    // V91: si INSTANCE_SECTOR no llegó al contenedor, inferirlo de INSTANCE_CODE.
+    // Esto mantiene la API bloqueada a su instancia en vez de abrirla como compartida.
+    string code = GetInstanceCode();
+    if (code.Contains("PREMIUM_ARRIBA") || code.EndsWith("_ARRIBA")) return "ARRIBA";
+    if (code.Contains("PREMIUM_ABAJO") || code.EndsWith("_ABAJO")) return "ABAJO";
+    if (code.Contains("EL_BRUJO") || code.Contains("CLUB") || code.EndsWith("_GENERAL")) return "GENERAL";
     return "";
 }
 
