@@ -37,6 +37,7 @@ try
     await EnsureSectorLayoutAsync(startupCon);
     await EnsurePremiumSharedCatalogAsync(startupCon);
     await EnsurePremiumSectorStockAsync(startupCon);
+    await EnsureSingleInstanceProductUniquenessAsync(startupCon);
     await EnsureInitialStockLedgerV76Async(startupCon);
     await EnsureMesasEnVivoTables(startupCon);
     await EnsureOfficialBranchAndTableLayout(startupCon);
@@ -92,7 +93,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V92_STOCK_ID_CORRECTO",
+            version = "V93_STOCK_CANONICO",
             instanceCode = GetInstanceCode(),
             instanceSucursalId = GetInstanceSucursalId(),
             instanceSector = GetInstanceSector(),
@@ -113,13 +114,13 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V92_STOCK_ID_CORRECTO",
+    apiVersion = "V93_STOCK_CANONICO",
     instanceCode = GetInstanceCode(),
     instanceSucursalId = GetInstanceSucursalId(),
     instanceSector = GetInstanceSector(),
     minimumClientVersion = 167,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "API V90. Instancias separadas por sucursal/sector, stock remoto idempotente y protección contra cruces entre ARRIBA/ABAJO/EL BRUJO."
+    message = "API V93. Stock canónico por producto en instancia separada, reposición remota idempotente y protección contra duplicados."
 }));
 
 app.MapGet("/api/sheets/status", async (SheetsReporter sheets) =>
@@ -830,6 +831,7 @@ app.MapPost("/api/admin/productos/ajustar-stock", async (Db db, string clave, Ad
 
     await using var con = await db.OpenAsync();
     await EnsurePremiumSectorStockAsync(con);
+    await EnsureSingleInstanceProductUniquenessAsync(con);
     await using var tx = await con.BeginTransactionAsync();
     try
     {
@@ -3993,6 +3995,7 @@ app.MapPost("/api/admin/inventario/consulta", async (Db db, AdminInventoryQueryR
     await EnsureAppMeseraTables(con);
     await EnsureSectorLayoutAsync(con);
     await EnsurePremiumSectorStockAsync(con);
+    await EnsureSingleInstanceProductUniquenessAsync(con);
     if (!await ValidarAdministradorAsync(con, req.Usuario, req.Clave)) return Results.Unauthorized();
     int sid = ResolveInstanceSucursalId(req.SucursalId);
 
@@ -4105,6 +4108,7 @@ app.MapPost("/api/admin/inventario/reponer", async (Db db, AdminInventoryAdjustR
     await EnsureAppMeseraTables(con);
     await EnsureSectorLayoutAsync(con);
     await EnsurePremiumSectorStockAsync(con);
+    await EnsureSingleInstanceProductUniquenessAsync(con);
     if (!await ValidarAdministradorAsync(con, req.Usuario, req.Clave)) return Results.Unauthorized();
 
     int sid = ResolveInstanceSucursalId(req.SucursalId);
@@ -4140,32 +4144,21 @@ app.MapPost("/api/admin/inventario/reponer", async (Db db, AdminInventoryAdjustR
         long productoId = 0;
         decimal stockAntes = 0m;
         string nombreReal = producto;
-        string lookupSql = req.ProductoId.HasValue && req.ProductoId.Value > 0
-            ? """
-              SELECT id, nombre, stock_actual
-              FROM productos
-              WHERE id=@pid AND sucursal_id=@sid AND sector=@sector AND estado='ACTIVO'
-              LIMIT 1
-              FOR UPDATE;
-              """
-            : """
-              SELECT id, nombre, stock_actual
-              FROM productos
-              WHERE sucursal_id=@sid AND sector=@sector AND estado='ACTIVO'
-                AND LOWER(TRIM(nombre))=LOWER(TRIM(@nombre))
-              ORDER BY id
-              LIMIT 1
-              FOR UPDATE;
-              """;
-        await using (var q = new MySqlCommand(lookupSql, con, tx))
+
+        // V93: si la App trae un ID antiguo de una fila duplicada que ya fue desactivada,
+        // primero intentamos ese ID y luego SIEMPRE hacemos respaldo por nombre.
+        if (req.ProductoId.HasValue && req.ProductoId.Value > 0)
         {
-            q.Parameters.AddWithValue("@sid", sid);
-            q.Parameters.AddWithValue("@sector", sector);
-            if (req.ProductoId.HasValue && req.ProductoId.Value > 0)
-                q.Parameters.AddWithValue("@pid", req.ProductoId.Value);
-            else
-                q.Parameters.AddWithValue("@nombre", producto);
-            await using var rr = await q.ExecuteReaderAsync();
+            await using var qId = new MySqlCommand("""
+                SELECT id, nombre, stock_actual
+                FROM productos
+                WHERE id=@pid AND sucursal_id=@sid AND sector=@sector AND estado='ACTIVO'
+                LIMIT 1 FOR UPDATE;
+            """, con, tx);
+            qId.Parameters.AddWithValue("@pid", req.ProductoId.Value);
+            qId.Parameters.AddWithValue("@sid", sid);
+            qId.Parameters.AddWithValue("@sector", sector);
+            await using var rr = await qId.ExecuteReaderAsync();
             if (await rr.ReadAsync())
             {
                 productoId = Convert.ToInt64(rr["id"]);
@@ -4173,6 +4166,29 @@ app.MapPost("/api/admin/inventario/reponer", async (Db db, AdminInventoryAdjustR
                 stockAntes = Convert.ToDecimal(rr["stock_actual"]);
             }
         }
+
+        if (productoId <= 0)
+        {
+            await using var qName = new MySqlCommand("""
+                SELECT id, nombre, stock_actual
+                FROM productos
+                WHERE sucursal_id=@sid AND sector=@sector AND estado='ACTIVO'
+                  AND LOWER(TRIM(nombre))=LOWER(TRIM(@nombre))
+                ORDER BY id
+                LIMIT 1 FOR UPDATE;
+            """, con, tx);
+            qName.Parameters.AddWithValue("@sid", sid);
+            qName.Parameters.AddWithValue("@sector", sector);
+            qName.Parameters.AddWithValue("@nombre", producto);
+            await using var rr = await qName.ExecuteReaderAsync();
+            if (await rr.ReadAsync())
+            {
+                productoId = Convert.ToInt64(rr["id"]);
+                nombreReal = rr.IsDBNull(rr.GetOrdinal("nombre")) ? producto : rr.GetString("nombre");
+                stockAntes = Convert.ToDecimal(rr["stock_actual"]);
+            }
+        }
+
         if (productoId <= 0)
             throw new InvalidOperationException("Producto no encontrado en " + (sid == 2 ? sector : "EL BRUJO") + ". Actualiza el inventario e inténtalo nuevamente.");
 
@@ -4205,9 +4221,14 @@ app.MapPost("/api/admin/inventario/reponer", async (Db db, AdminInventoryAdjustR
             if (await up.ExecuteNonQueryAsync() != 1) throw new InvalidOperationException("No se pudo actualizar el inventario.");
         }
 
+        decimal stockDespues;
+        await using (var qStock = new MySqlCommand("SELECT stock_actual FROM productos WHERE id=@id LIMIT 1;", con, tx))
+        {
+            qStock.Parameters.AddWithValue("@id", productoId);
+            stockDespues = Convert.ToDecimal(await qStock.ExecuteScalarAsync() ?? 0m);
+        }
         await tx.CommitAsync();
-        decimal stockDespues = stockAntes + req.Cantidad;
-        return Results.Ok(new { ok=true, idempotent=false, operationKey, producto=nombreReal, productoId, sector, cantidad=req.Cantidad, stockAntes, stockDespues, message="Stock actualizado correctamente." });
+        return Results.Ok(new { ok=true, idempotent=false, operationKey, producto=nombreReal, productoId, sector, cantidad=req.Cantidad, stockAntes, stockDespues, message=$"Stock actualizado: {stockAntes} + {req.Cantidad} = {stockDespues}." });
     }
     catch (Exception ex)
     {
@@ -4222,6 +4243,7 @@ app.MapPost("/api/admin/inventario/transferir", async (Db db, AdminInventoryTran
         return Results.BadRequest(new { ok=false, message="Esta API pertenece a un solo sector. El traspaso ARRIBA/ABAJO debe hacerse desde el Administrador General entre las dos APIs, no dentro de una sola API." });
     await using var con = await db.OpenAsync();
     await EnsurePremiumSectorStockAsync(con);
+    await EnsureSingleInstanceProductUniquenessAsync(con);
     if (!await ValidarAdministradorAsync(con, req.Usuario, req.Clave)) return Results.Unauthorized();
     if (req.Cantidad <= 0) return Results.BadRequest(new {ok=false,message="Cantidad inválida."});
     string origen=NormalizarSector(2,req.SectorOrigen), destino=NormalizarSector(2,req.SectorDestino);
@@ -5976,6 +5998,101 @@ static string NormalizarSectorProducto(int sucursalId, string? sector = null)
     string raw=(sector ?? "").Trim().ToUpperInvariant();
     if (string.IsNullOrWhiteSpace(raw) || raw=="GENERAL" || raw.Contains("COMPARTIDO")) return "ABAJO";
     return NormalizeRequestedSectorWithoutInstance(sid, sector);
+}
+
+static async Task EnsureSingleInstanceProductUniquenessAsync(MySqlConnection con)
+{
+    if (!IsPremiumSingleSectorInstance()) return;
+
+    string sector = GetInstanceSector();
+    var rows = new List<(long id, string nombre, decimal stock, decimal minimo)>();
+    await using (var q = new MySqlCommand("""
+        SELECT id,nombre,stock_actual,stock_minimo
+        FROM productos
+        WHERE sucursal_id=2 AND sector=@sector AND estado='ACTIVO'
+        ORDER BY id;
+    """, con))
+    {
+        q.Parameters.AddWithValue("@sector", sector);
+        await using var rd = await q.ExecuteReaderAsync();
+        while (await rd.ReadAsync())
+            rows.Add((
+                rd.GetInt64(0),
+                rd.IsDBNull(1) ? "" : rd.GetString(1),
+                rd.IsDBNull(2) ? 0m : rd.GetDecimal(2),
+                rd.IsDBNull(3) ? 0m : rd.GetDecimal(3)
+            ));
+    }
+
+    var duplicateGroups = rows
+        .Where(x => !string.IsNullOrWhiteSpace(x.nombre))
+        .GroupBy(x => x.nombre.Trim().ToUpperInvariant())
+        .Where(g => g.Count() > 1)
+        .ToList();
+
+    if (duplicateGroups.Count == 0) return;
+
+    await using var tx = await con.BeginTransactionAsync();
+    try
+    {
+        foreach (var group in duplicateGroups)
+        {
+            var list = group.OrderBy(x => x.id).ToList();
+            long canonicalId = list[0].id;
+            decimal stockConservador = list.Max(x => Math.Max(0m, x.stock));
+            decimal minimo = list.Max(x => Math.Max(0m, x.minimo));
+
+            // Nunca sumamos duplicados: preservamos el mayor stock observado para no inflar inventario.
+            await using (var up = new MySqlCommand("UPDATE productos SET stock_actual=@stock, stock_minimo=@minimo, estado='ACTIVO' WHERE id=@id;", con, tx))
+            {
+                up.Parameters.AddWithValue("@stock", stockConservador);
+                up.Parameters.AddWithValue("@minimo", minimo);
+                up.Parameters.AddWithValue("@id", canonicalId);
+                await up.ExecuteNonQueryAsync();
+            }
+
+            foreach (var dup in list.Skip(1))
+            {
+                await using (var copyPres = new MySqlCommand("""
+                    INSERT INTO presentaciones(producto_id,nombre,cantidad_base,precio_venta,estado)
+                    SELECT @canonical,p.nombre,p.cantidad_base,p.precio_venta,p.estado
+                    FROM presentaciones p
+                    WHERE p.producto_id=@duplicate
+                      AND NOT EXISTS (
+                        SELECT 1 FROM presentaciones c
+                        WHERE c.producto_id=@canonical
+                          AND LOWER(TRIM(c.nombre))=LOWER(TRIM(p.nombre))
+                      );
+                """, con, tx))
+                {
+                    copyPres.Parameters.AddWithValue("@canonical", canonicalId);
+                    copyPres.Parameters.AddWithValue("@duplicate", dup.id);
+                    await copyPres.ExecuteNonQueryAsync();
+                }
+
+                // Conserva historial de entradas bajo el producto canónico.
+                await using (var mv = new MySqlCommand("UPDATE movimientos_inventario_admin SET producto_id=@canonical WHERE producto_id=@duplicate AND sucursal_id=2 AND sector=@sector;", con, tx))
+                {
+                    mv.Parameters.AddWithValue("@canonical", canonicalId);
+                    mv.Parameters.AddWithValue("@duplicate", dup.id);
+                    mv.Parameters.AddWithValue("@sector", sector);
+                    await mv.ExecuteNonQueryAsync();
+                }
+
+                await using (var off = new MySqlCommand("UPDATE productos SET estado='INACTIVO' WHERE id=@id;", con, tx))
+                {
+                    off.Parameters.AddWithValue("@id", dup.id);
+                    await off.ExecuteNonQueryAsync();
+                }
+            }
+        }
+        await tx.CommitAsync();
+    }
+    catch
+    {
+        try { await tx.RollbackAsync(); } catch { }
+        throw;
+    }
 }
 
 static async Task EnsurePremiumSharedCatalogAsync(MySqlConnection con)
