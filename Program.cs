@@ -92,7 +92,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V91_INSTANCIA_FIJA",
+            version = "V92_STOCK_ID_CORRECTO",
             instanceCode = GetInstanceCode(),
             instanceSucursalId = GetInstanceSucursalId(),
             instanceSector = GetInstanceSector(),
@@ -113,7 +113,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V91_INSTANCIA_FIJA",
+    apiVersion = "V92_STOCK_ID_CORRECTO",
     instanceCode = GetInstanceCode(),
     instanceSucursalId = GetInstanceSucursalId(),
     instanceSector = GetInstanceSector(),
@@ -4010,7 +4010,34 @@ app.MapPost("/api/admin/inventario/consulta", async (Db db, AdminInventoryQueryR
         );
     """, con)) await create.ExecuteNonQueryAsync();
 
-    string sql = sid == 2 ? """
+    // V92: en una API de sector fijo NO agrupamos por nombre. Antes, si existían dos filas
+    // históricas con el mismo nombre, producto_id_arriba podía pertenecer a una fila y
+    // stock_arriba (MAX) a otra. Resultado: la reposición se aplicaba, pero la App seguía
+    // mostrando el mismo stock. En instancia aislada cada fila conserva su ID y su stock.
+    string premiumSql = IsPremiumSingleSectorInstance() ? """
+        SELECT p.nombre AS producto,
+               p.categoria AS categoria,
+               p.unidad_base AS unidad_base,
+               CASE WHEN @instance_sector='ARRIBA' THEN p.id ELSE 0 END AS producto_id_arriba,
+               CASE WHEN @instance_sector='ABAJO' THEN p.id ELSE 0 END AS producto_id_abajo,
+               CASE WHEN @instance_sector='ARRIBA' THEN p.stock_actual ELSE 0 END AS stock_arriba,
+               CASE WHEN @instance_sector='ABAJO' THEN p.stock_actual ELSE 0 END AS stock_abajo,
+               p.stock_actual AS stock_total,
+               COALESCE(SUM(CASE WHEN m.delta>0 AND m.sector='ARRIBA' THEN m.delta ELSE 0 END),0) AS entradas_arriba,
+               COALESCE(SUM(CASE WHEN m.delta>0 AND m.sector='ABAJO' THEN m.delta ELSE 0 END),0) AS entradas_abajo,
+               COALESCE(SUM(CASE WHEN m.delta>0 AND UPPER(COALESCE(m.motivo,'')) NOT LIKE 'TRANSFERENCIA%' THEN m.delta ELSE 0 END),0) AS entradas_total,
+               p.stock_minimo AS stock_minimo,
+               COALESCE(p.sin_limite_stock,0) AS sin_limite_stock,
+               COALESCE(p.rendimiento_vaso,10) AS rendimiento_vaso,
+               CASE WHEN @instance_sector='ARRIBA' THEN COALESCE(vc.servicios_restantes,0) ELSE 0 END AS vasos_abiertos_arriba,
+               CASE WHEN @instance_sector='ABAJO' THEN COALESCE(vc.servicios_restantes,0) ELSE 0 END AS vasos_abiertos_abajo
+        FROM productos p
+        LEFT JOIN movimientos_inventario_admin m ON m.producto_id=p.id AND m.sucursal_id=p.sucursal_id
+        LEFT JOIN vaso_control vc ON vc.sucursal_id=p.sucursal_id AND vc.sector=p.sector AND vc.producto_id=p.id
+        WHERE p.sucursal_id=2 AND p.estado='ACTIVO' AND p.sector=@instance_sector
+        GROUP BY p.id,p.nombre,p.categoria,p.unidad_base,p.stock_actual,p.stock_minimo,p.sin_limite_stock,p.rendimiento_vaso,vc.servicios_restantes
+        ORDER BY p.categoria,p.nombre,p.id;
+    """ : """
         SELECT MIN(p.nombre) AS producto,
                MIN(p.categoria) AS categoria,
                MIN(p.unidad_base) AS unidad_base,
@@ -4031,12 +4058,12 @@ app.MapPost("/api/admin/inventario/consulta", async (Db db, AdminInventoryQueryR
         FROM productos p
         LEFT JOIN movimientos_inventario_admin m ON m.producto_id=p.id AND m.sucursal_id=p.sucursal_id
         LEFT JOIN vaso_control vc ON vc.sucursal_id=p.sucursal_id AND vc.sector=p.sector AND vc.producto_id=p.id
-        WHERE p.sucursal_id=2 AND p.estado='ACTIVO'
-          AND p.sector IN ('ARRIBA','ABAJO')
-          AND (@instance_sector = '' OR p.sector = @instance_sector)
+        WHERE p.sucursal_id=2 AND p.estado='ACTIVO' AND p.sector IN ('ARRIBA','ABAJO')
         GROUP BY LOWER(TRIM(p.nombre))
         ORDER BY categoria, producto;
-    """ : """
+    """;
+
+    string sql = sid == 2 ? premiumSql : """
         SELECT p.id AS producto_id,p.nombre AS producto,p.categoria,p.unidad_base,
                p.stock_actual AS stock_actual,
                COALESCE(SUM(CASE WHEN m.delta>0 THEN m.delta ELSE 0 END),0) AS entradas_total,
